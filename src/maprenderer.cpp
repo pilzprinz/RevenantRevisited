@@ -867,6 +867,55 @@ static bool TilePlanesToRGBA(const STileBitmapPlanes& p, SPalette* pal,
 // high-res art to the retail coverage (the modern mode).
 // (Defined below, outside this file's anonymous namespace.)
 
+// The depth-map builder: the retail z-buffer as the renderer's local-z
+// floats (z per texel, 0 where transparent), with min/max and the
+// depth-dump diagnostics. The exported PTBitmap wrapper the reload uses
+// lives below, next to the other art-tree helpers.
+static bool BuildTileDepthMap(const STileBitmapPlanes& planes, std::vector<float>& out_depth,
+                              SSectorTileTex::SDepthDump* out_dump,
+                              float* out_zmin, float* out_zmax)
+{
+    if (!planes.has_zbuffer)
+        return false;
+    const int32_t w = planes.w, h = planes.h;
+    const size_t npx = size_t(w) * size_t(h);
+    out_depth.assign(npx, 0.0f);
+    float zmin = FLT_MAX, zmax = -FLT_MAX;
+    SSectorTileTex::SDepthDump dump;
+    for (size_t i = 0; i < npx; ++i)
+    {
+        const uint16_t z = planes.z[i];
+        const bool transparent = (z == 0 || z == 0x7F7F);
+        if (transparent)
+        {
+            out_depth[i] = 0.0f;
+            continue;
+        }
+        ++dump.sample_count;
+        const int32_t px = int32_t(i % size_t(w));
+        const int32_t py = int32_t(i / size_t(w));
+        if (px < dump.bbox_x0) dump.bbox_x0 = px;
+        if (py < dump.bbox_y0) dump.bbox_y0 = py;
+        if (px + 1 > dump.bbox_x1) dump.bbox_x1 = px + 1;
+        if (py + 1 > dump.bbox_y1) dump.bbox_y1 = py + 1;
+        const float z_local = float(int16_t(z));
+        out_depth[i] = z_local;
+        if (z_local < zmin) zmin = z_local;
+        if (z_local > zmax) zmax = z_local;
+    }
+    if (zmin == FLT_MAX) zmin = 0.0f;
+    if (zmax == -FLT_MAX) zmax = 0.0f;
+    if (dump.sample_count == 0)
+    {
+        dump.bbox_x0 = dump.bbox_y0 = 0;
+        dump.bbox_x1 = dump.bbox_y1 = 0;
+    }
+    if (out_dump) *out_dump = dump;
+    if (out_zmin) *out_zmin = zmin;
+    if (out_zmax) *out_zmax = zmax;
+    return true;
+}
+
 static bool UploadTileBitmap(PTBitmap bm,
                              RendererImagePairHandle* out_image_pair,
                              uint64_t* out_key,
@@ -904,48 +953,24 @@ static bool UploadTileBitmap(PTBitmap bm,
     if (!TilePlanesToRGBA(planes, pal, rgba, &any_alpha))
         return false;
 
-    std::vector<float> dflt(npx, 0.0f);
-    float z_local_min = FLT_MAX, z_local_max = -FLT_MAX;
-    SSectorTileTex::SDepthDump z_dump = {};
-    for (size_t i = 0; i < npx; ++i)
+    std::vector<float> dflt;
+    float z_local_min = 0.0f, z_local_max = 0.0f;
+    SSectorTileTex::SDepthDump z_dump;
+    if (!BuildTileDepthMap(planes, dflt, &z_dump, &z_local_min, &z_local_max))
     {
-        const uint8_t idx8 = planes.is_8bit ? planes.idx[i] : 0;
-        const uint16_t px16 = planes.is_8bit ? 0 : planes.rgb16[i];
-        const uint16_t z = planes.has_zbuffer ? planes.z[i] : 0;
-        const bool transparent = planes.has_zbuffer ? (z == 0 || z == 0x7F7F)
-                                                  : (planes.is_8bit ? (idx8 == planes.key8) : (px16 == planes.key16));
-        if (transparent) { dflt[i] = 0.0f; continue; }
-        if (!planes.has_zbuffer) { dflt[i] = 0.0f; continue; }
-        ++z_dump.sample_count;
-        if (z & 0x8000) ++z_dump.high_bit_count;
-        if (z < z_dump.u16_min) z_dump.u16_min = z;
-        if (z > z_dump.u16_max) z_dump.u16_max = z;
-        const int32_t px = int32_t(i % size_t(w));
-        const int32_t py = int32_t(i / size_t(w));
-        if (px < z_dump.bbox_x0) z_dump.bbox_x0 = px;
-        if (py < z_dump.bbox_y0) z_dump.bbox_y0 = py;
-        if (px + 1 > z_dump.bbox_x1) z_dump.bbox_x1 = px + 1;
-        if (py + 1 > z_dump.bbox_y1) z_dump.bbox_y1 = py + 1;
-        const float z_local = float(int16_t(z));
-        dflt[i] = z_local;
-        if (z_local < z_local_min) z_local_min = z_local;
-        if (z_local > z_local_max) z_local_max = z_local;
-    }
-    if (z_local_min == FLT_MAX) z_local_min = 0.0f;
-    if (z_local_max == -FLT_MAX) z_local_max = 0.0f;
-    if (z_dump.sample_count == 0) {
-        z_dump.u16_min = z_dump.u16_max = 0;
-        z_dump.i16_min = z_dump.i16_max = 0;
-        z_dump.bbox_x0 = z_dump.bbox_y0 = 0;
-        z_dump.bbox_x1 = z_dump.bbox_y1 = 0;
+        // No depth plane: the tile draws flat (the all-zero map, the same
+        // the pre-depth upload path used).
+        dflt.assign(npx, 0.0f);
+        z_dump = {};
     }
     const uint64_t key = RendererSourcePointerKey(1u, bm);
 
-    // High-res tile art (see tiletexoverride.h). The colour is swapped for the
-    // matching upscaled PNG; depth, coverage and every derived value below
-    // stay retail's. The art is clipped to the retail coverage (the depth
-    // map's shape), so the tile's shape is the coverage and the art only
-    // fills it.
+    // High-res tile art (see tiletexoverride.h). The colour is swapped for
+    // the matching upscaled PNG; the coverage is the tree's own _alpha map
+    // when the tile carries one, the retail silhouette otherwise, and the
+    // relief is the tree's own _depth map (rescaled into the retail z range)
+    // when the tile carries one. Everything else -- the derived values below,
+    // the registrations -- stays as the pair holds it.
     //
     // The tile art mode ([Revisited] HighResTileMode) decides what a tile
     // starts with: 0 = the retail pixels, 1 = the tree's art. The mode can
@@ -959,17 +984,19 @@ static bool UploadTileBitmap(PTBitmap bm,
     size_t depth_size = npx * sizeof(float);
     TileTexOverride::SImage override_image;
     bool override_used = false;
+    bool depth_replaced = false;
     if (override_name && override_objtype >= 0 && Renderer->ImagePairForKey(key) == 0 &&
         RevisitedSettings.high_res_tile_mode == 1 &&
         TileTexOverride::Load(override_objtype, override_name, override_image) &&
         override_image.width > 0 && override_image.height > 0)
     {
-        MapClipArtToCoverage(override_image.rgba, override_image.width, override_image.height,
-                              rgba.data(), w, h);
+        const bool tree_alpha =
+            MapApplyTileArtCoverage(override_image, override_objtype, override_name,
+                                    rgba.data(), w, h);
         log_info("[tiletex] %s %dx%d -> %dx%d (%.2fx)%s", override_name, w, h,
                  override_image.width, override_image.height,
                  float(override_image.width) / float(w),
-                 override_image.has_alpha ? " (own alpha)" : "");
+                 tree_alpha ? " (tree alpha map)" : "");
         color_pixels = override_image.rgba.data();
         color_size = override_image.rgba.size();
         color_w = override_image.width;
@@ -977,12 +1004,45 @@ static bool UploadTileBitmap(PTBitmap bm,
         override_used = true;
     }
 
+    // The tile's own _depth map, when the tree carries one and the depth
+    // mode asks for it (independent of the colour mode, see
+    // HighResTileDepthMode): the relief's shape becomes the art's, scaled
+    // into the tile's retail z range so the tile keeps standing at its own
+    // level.
+    if (override_name && override_objtype >= 0 && Renderer->ImagePairForKey(key) == 0 &&
+        RevisitedSettings.high_res_tile_depth_mode == 1)
+    {
+        TileTexOverride::SImage depth_image;
+        float rzmin = 0.0f, rzmax = 0.0f;
+        if (TileTexOverride::LoadDepth(override_objtype, override_name, depth_image) &&
+            MapDecodeTileDepthRange(bm, rzmin, rzmax))
+        {
+            std::vector<float> art_depth;
+            float nzmin = 0.0f, nzmax = 0.0f;
+            SSectorTileTex::SDepthDump art_dump;
+            if (MapDecodeTileDepthFromArt(depth_image, w, h, rzmin, rzmax,
+                                          art_depth, &art_dump, &nzmin, &nzmax))
+            {
+                dflt = std::move(art_depth);
+                z_local_min = nzmin;
+                z_local_max = nzmax;
+                z_dump = art_dump;
+                depth_pixels = dflt.data();
+                depth_size = dflt.size() * sizeof(float);
+                depth_replaced = true;
+                log_info("[tiletex] %s: tree depth map applied (z %.0f..%.0f -> %.0f..%.0f)",
+                         override_name, rzmin, rzmax, nzmin, nzmax);
+            }
+        }
+    }
+
     const uint64_t gpu_bytes = uint64_t(color_size) + uint64_t(depth_size);
     *out_image_pair = Renderer->RegisterImagePairAsset(key,
                                                        color_pixels, color_size,
                                                        depth_pixels, depth_size,
                                                        w, h, gpu_bytes,
-                                                       color_w, color_h);
+                                                       color_w, color_h,
+                                                       depth_replaced);
     if (!*out_image_pair)
     {
         static bool once = false;
@@ -1004,7 +1064,9 @@ static bool UploadTileBitmap(PTBitmap bm,
             (*out_cpu_opaque)[i] = rgba[i * 4 + 3] ? 1 : 0;
     }
     // Whether the tree's art is in the colour image now: the art reload
-    // needs to know which tiles have something to put back.
+    // needs to know which tiles have something to put back. (The depth
+    // state lives in the image pair itself -- see SRendererImagePairInfo::
+    // depth_is_art; the registration above passed depth_replaced along.)
     if (out_modern) *out_modern = override_used;
     return true;
 }
@@ -1242,9 +1304,181 @@ bool MapDecodeTileBitmapRGBA(PTBitmap bm, std::vector<uint8_t>& out_rgba,
     return true;
 }
 
+// Same clip with the tree's own mask: the art's alpha is zeroed where the
+// mask is transparent, the mask sampled nearest at its own resolution.
+// (File-local: the callers go through MapApplyTileArtCoverage.)
+static void MapClipArtToMask(std::vector<uint8_t>& art, int32_t aw, int32_t ah,
+                              const std::vector<uint8_t>& mask, int32_t mw, int32_t mh)
+{
+    if (aw <= 0 || ah <= 0 || mw <= 0 || mh <= 0 ||
+        mask.size() < size_t(mw) * size_t(mh))
+        return;
+    for (int32_t y = 0; y < ah; ++y)
+    {
+        const int32_t sy = int32_t((int64_t(y) * mh) / ah);
+        const uint8_t* src = mask.data() + size_t(sy) * size_t(mw);
+        uint8_t* dst = art.data() + (size_t(y) * size_t(aw)) * 4 + 3;
+        for (int32_t x = 0; x < aw; ++x)
+        {
+            if (!src[size_t((int64_t(x) * mw) / aw)])
+                dst[size_t(x) * 4] = 0;
+        }
+    }
+}
+
+// The mask byte of a decoded PNG. The dump writes every file as fully
+// opaque RGBA (the mask in the colour), so the alpha channel alone can not
+// be trusted: "opaque and not black" reads both the dump's masks (colour
+// 255/0, background pure black) and a masked PNG's (alpha-carried), and
+// treats an opaque black background as transparent in both.
+static uint8_t TileMaskSample(const TileTexOverride::SImage& png, size_t i)
+{
+    const uint8_t* px = png.rgba.data() + i * 4;
+    return (px[3] >= 128 && (px[0] | px[1] | px[2])) ? 255 : 0;
+}
+
+// The tree's _alpha PNG (TileTexOverride::LoadAlpha) as a per-pixel opaque
+// mask at the PNG's own size. (File-local: the callers go through
+// MapApplyTileArtCoverage.)
+static bool MapDecodeTileAlphaMask(const TileTexOverride::SImage& png,
+                                   std::vector<uint8_t>& out_mask)
+{
+    if (png.width <= 0 || png.height <= 0 ||
+        png.rgba.size() < size_t(png.width) * size_t(png.height) * 4)
+        return false;
+    const size_t n = size_t(png.width) * size_t(png.height);
+    out_mask.resize(n);
+    for (size_t i = 0; i < n; ++i)
+        out_mask[i] = TileMaskSample(png, i) ? 1 : 0;
+    return true;
+}
+
+// The coverage the tree's art is clipped to, in one call: the tile's own
+// _alpha map when the tree carries one, the retail silhouette otherwise.
+// The tile upload and the art reload both go through here, so the panel and
+// the load can not drift apart. Returns whether the tree's mask was used.
+bool MapApplyTileArtCoverage(TileTexOverride::SImage& art,
+                             int32_t objtype, const char* type_name,
+                             const uint8_t* retail_rgba, int32_t rw, int32_t rh)
+{
+    TileTexOverride::SImage alpha_image;
+    std::vector<uint8_t> art_mask;
+    if (objtype >= 0 && type_name && *type_name &&
+        TileTexOverride::LoadAlpha(objtype, type_name, alpha_image) &&
+        MapDecodeTileAlphaMask(alpha_image, art_mask))
+    {
+        MapClipArtToMask(art.rgba, art.width, art.height,
+                         art_mask, alpha_image.width, alpha_image.height);
+        return true;
+    }
+    MapClipArtToCoverage(art.rgba, art.width, art.height, retail_rgba, rw, rh);
+    return false;
+}
+
+bool MapDecodeTileDepthRange(PTBitmap bm, float& out_zmin, float& out_zmax)
+{
+    out_zmin = out_zmax = 0.0f;
+    if (!bm)
+        return false;
+    STileBitmapPlanes planes;
+    if (!LoadTileBitmapPlanes(bm, planes))
+        return false;
+    std::vector<float> depth;
+    return BuildTileDepthMap(planes, depth, nullptr, &out_zmin, &out_zmax);
+}
+
+bool MapDecodeTileDepthFromArt(const TileTexOverride::SImage& png,
+                               int32_t w, int32_t h,
+                               float zmin, float zmax,
+                               std::vector<float>& out_depth,
+                               SSectorTileTex::SDepthDump* out_dump,
+                               float* out_zmin, float* out_zmax)
+{
+    if (w <= 0 || h <= 0 || png.width <= 0 || png.height <= 0 ||
+        png.rgba.size() < size_t(png.width) * size_t(png.height) * 4)
+        return false;
+
+    // The dump's t from the three channels (R = 255t, G = 128+127t,
+    // B = 255(1-t)). Averaging the three estimates buys a little precision
+    // back from the 8-bit channels.
+    auto decode_t = [&png](size_t i)
+    {
+        const uint8_t* px = png.rgba.data() + i * 4;
+        const float r = float(px[0]) / 255.0f;
+        const float g = (float(px[1]) - 128.0f) / 127.0f;
+        const float b = 1.0f - float(px[2]) / 255.0f;
+        float t = (r + g + b) / 3.0f;
+        return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    };
+    // Valid-texel mask, the same "opaque and not black" rule the alpha mask
+    // uses (see TileMaskSample): the dump's depth map is fully opaque RGBA
+    // with a pure-black background, and a masked PNG keys on its alpha. The
+    // dump's valid texels always carry colour (G >= 128), so a black texel
+    // is the background in every format this accepts.
+    auto opaque = [&png](size_t i)
+    {
+        const uint8_t* px = png.rgba.data() + i * 4;
+        return px[3] >= 128 && (px[0] | px[1] | px[2]) != 0;
+    };
+
+    const float span = (zmax > zmin) ? (zmax - zmin) : 0.0f;
+    out_depth.assign(size_t(w) * size_t(h), 0.0f);
+    float nmin = FLT_MAX, nmax = -FLT_MAX;
+    SSectorTileTex::SDepthDump dump;
+    for (int32_t y = 0; y < h; ++y)
+    {
+        const int32_t sy = int32_t((int64_t(y) * png.height) / h);
+        const int32_t py = y;
+        for (int32_t x = 0; x < w; ++x)
+        {
+            const int32_t sx = int32_t((int64_t(x) * png.width) / w);
+            const size_t src = size_t(sy) * size_t(png.width) + size_t(sx);
+            const size_t dst = size_t(y) * size_t(w) + size_t(x);
+            if (!opaque(src))
+            {
+                out_depth[dst] = 0.0f;
+                continue;
+            }
+            const float z = zmin + decode_t(src) * span;
+            out_depth[dst] = z;
+            if (z < nmin) nmin = z;
+            if (z > nmax) nmax = z;
+            ++dump.sample_count;
+            if (x < dump.bbox_x0) dump.bbox_x0 = x;
+            if (py < dump.bbox_y0) dump.bbox_y0 = py;
+            if (x + 1 > dump.bbox_x1) dump.bbox_x1 = x + 1;
+            if (py + 1 > dump.bbox_y1) dump.bbox_y1 = py + 1;
+        }
+    }
+    if (dump.sample_count == 0)
+    {
+        dump.bbox_x0 = dump.bbox_y0 = 0;
+        dump.bbox_x1 = dump.bbox_y1 = 0;
+    }
+    if (out_dump) *out_dump = dump;
+    if (out_zmin) *out_zmin = (nmin == FLT_MAX) ? 0.0f : nmin;
+    if (out_zmax) *out_zmax = (nmax == -FLT_MAX) ? 0.0f : nmax;
+    return true;
+}
+
+// The PTBitmap wrapper the reload uses: decode the planes, build the map.
+bool MapDecodeTileDepthLocal(PTBitmap bm, std::vector<float>& out_depth,
+                             SSectorTileTex::SDepthDump* out_dump,
+                             float* out_zmin, float* out_zmax)
+{
+    if (!bm)
+        return false;
+    STileBitmapPlanes planes;
+    if (!LoadTileBitmapPlanes(bm, planes))
+        return false;
+    return BuildTileDepthMap(planes, out_depth, out_dump, out_zmin, out_zmax);
+}
+
 // Remember a loaded tile so the art reload can re-colour it. One entry per
 // image pair: the same bitmap uploaded twice (two map renderers, the same
-// tile in two sectors) is one GPU image and one entry.
+// tile in two sectors) is one GPU image and one entry. (The depth state is
+// not noted here: the image pair itself holds it -- SRendererImagePairInfo::
+// depth_is_art.)
 void NoteTileArt(std::vector<STileArtEntry>& registry,
                  RendererImagePairHandle image_pair,
                  void* bm, int32_t objtype, const char* type_name,
@@ -2359,6 +2593,52 @@ STileArtEntry* TMapRenderer::TileArtAt(int32_t index) const
     if (!impl || index < 0 || index >= int32_t(impl->tileArt.size()))
         return nullptr;
     return &impl->tileArt[size_t(index)];
+}
+
+// Propagate a depth-image replacement into the CPU side (see the
+// declaration). The tile upload builds these copies when it registers the
+// pair; the depth reload swaps the image pair's depth in place and has to
+// refresh them, or the CPU projection and sorting keep the old relief.
+void TMapRenderer::UpdateTileArtDepthCPUCopy(RendererImagePairHandle image_pair,
+                                             const float* depth, size_t depth_count)
+{
+    if (!impl || !image_pair || !depth || depth_count == 0)
+        return;
+    for (SSectorTileTex& tex : impl->sectorTileTex)
+    {
+        if (tex.image_pair != image_pair)
+            continue;
+        tex.cpu_depth_local.assign(depth, depth + depth_count);
+        // The z range + the dump, the same shape BuildTileDepthMap builds.
+        float zmin = FLT_MAX, zmax = -FLT_MAX;
+        SSectorTileTex::SDepthDump dump;
+        for (size_t i = 0; i < depth_count; ++i)
+        {
+            const float z = depth[i];
+            if (z == 0.0f)
+                continue;   // the same "no height" the depth builders use
+            ++dump.sample_count;
+            const int32_t w = tex.w > 0 ? tex.w : 1;
+            const int32_t px = int32_t(i % size_t(w));
+            const int32_t py = int32_t(i / size_t(w));
+            if (px < dump.bbox_x0) dump.bbox_x0 = px;
+            if (py < dump.bbox_y0) dump.bbox_y0 = py;
+            if (px + 1 > dump.bbox_x1) dump.bbox_x1 = px + 1;
+            if (py + 1 > dump.bbox_y1) dump.bbox_y1 = py + 1;
+            if (z < zmin) zmin = z;
+            if (z > zmax) zmax = z;
+        }
+        if (zmin == FLT_MAX) zmin = 0.0f;
+        if (zmax == -FLT_MAX) zmax = 0.0f;
+        if (dump.sample_count == 0)
+        {
+            dump.bbox_x0 = dump.bbox_y0 = 0;
+            dump.bbox_x1 = dump.bbox_y1 = 0;
+        }
+        tex.z_local_min = zmin;
+        tex.z_local_max = zmax;
+        tex.z_dump = dump;
+    }
 }
 
 void TMapRenderer::SyncContentsCache()

@@ -2450,7 +2450,8 @@ RendererImagePairHandle TRenderer::RegisterImagePairAsset(uint64_t key,
                                                           int32_t height,
                                                           uint64_t gpu_bytes,
                                                           int32_t color_width,
-                                                          int32_t color_height)
+                                                          int32_t color_height,
+                                                          bool depth_is_art)
 {
     if (!color_rgba8 || !depth_r32f || width <= 0 || height <= 0)
         return 0;
@@ -2538,6 +2539,7 @@ RendererImagePairHandle TRenderer::RegisterImagePairAsset(uint64_t key,
         BuildTileTightProxyHull(static_cast<const float*>(depth_r32f), width, height);
     asset.tight_proxy_points = uint32_t(asset.tight_proxy_hull_px.size() / 2u);
     asset.gpu_bytes = gpu_bytes + height_minmax.bytes;
+    asset.depth_is_art = depth_is_art ? 1u : 0u;
     if (sg_query_image_state(asset.color) != SG_RESOURCESTATE_VALID ||
         sg_query_image_state(asset.depth) != SG_RESOURCESTATE_VALID ||
         sg_query_image_state(asset.height_minmax) != SG_RESOURCESTATE_VALID)
@@ -2649,6 +2651,97 @@ bool TRenderer::UpdateImagePairColor(RendererImagePairHandle handle,
     e.color = image;
     e.color_width = width;
     e.color_height = height;
+    return true;
+}
+
+// Replace the depth image of an image pair (a tile's relief). See the
+// declaration in renderer.h for the contract. The size must stay the pair's
+// own: the height min/max chain and the tight proxy hull are rebuilt from
+// the new depths, and everything keyed to the pair's size (the CPU copies,
+// the proxy raster) keeps working.
+bool TRenderer::UpdateImagePairDepth(RendererImagePairHandle handle,
+                                      const void* depth_r32f, size_t depth_bytes,
+                                      bool from_art)
+{
+    if (handle == 0 || handle > image_pair_assets.size() || !depth_r32f)
+        return false;
+    SRendererImagePairEntry& e = image_pair_assets[handle - 1];
+    if (depth_bytes != size_t(e.width) * size_t(e.height) * sizeof(float))
+    {
+        log_warn("[renderer] image pair %u wants %zu depth bytes for %dx%d -- skipped",
+                 (unsigned)handle, depth_bytes, e.width, e.height);
+        return false;
+    }
+
+    sg_image_desc depth_desc = {};
+    depth_desc.width = e.width;
+    depth_desc.height = e.height;
+    depth_desc.pixel_format = SG_PIXELFORMAT_R32F;
+    // Nearest, exactly like the first upload: filtering depth blends valid
+    // texels with the transparent ones and creates false seams in scene-z,
+    // normals and shadows.
+    depth_desc.min_filter = SG_FILTER_NEAREST;
+    depth_desc.mag_filter = SG_FILTER_NEAREST;
+    depth_desc.wrap_u = depth_desc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+    depth_desc.data.subimage[0][0] = { depth_r32f, depth_bytes };
+    depth_desc.label = "renderer.imagepair.depth";
+
+    sg_image depth = sg_make_image(&depth_desc);
+    if (sg_query_image_state(depth) != SG_RESOURCESTATE_VALID)
+    {
+        if (depth.id) sg_destroy_image(depth);
+        log_warn("[renderer] image pair %u could not recreate the depth image -- skipped",
+                 (unsigned)handle);
+        return false;
+    }
+
+    const SHeightMinMaxMipChain height_minmax =
+        BuildHeightMinMaxMipChain(static_cast<const float*>(depth_r32f),
+                                  e.width, e.height);
+    if (height_minmax.levels.empty())
+    {
+        sg_destroy_image(depth);
+        log_warn("[renderer] image pair %u could not rebuild the height chain -- skipped",
+                 (unsigned)handle);
+        return false;
+    }
+    sg_image_desc height_desc = {};
+    height_desc.width = e.width;
+    height_desc.height = e.height;
+    height_desc.num_mipmaps = int(height_minmax.levels.size());
+    height_desc.pixel_format = SG_PIXELFORMAT_RG32F;
+    height_desc.min_filter = SG_FILTER_NEAREST;
+    height_desc.mag_filter = SG_FILTER_NEAREST;
+    height_desc.wrap_u = height_desc.wrap_v = SG_WRAP_CLAMP_TO_EDGE;
+    for (int32_t mip = 0; mip < height_desc.num_mipmaps; ++mip)
+    {
+        const std::vector<float>& level = height_minmax.levels[size_t(mip)];
+        height_desc.data.subimage[0][mip] = { level.data(), level.size() * sizeof(float) };
+    }
+    height_desc.label = "renderer.imagepair.height_minmax";
+    sg_image height = sg_make_image(&height_desc);
+    if (sg_query_image_state(height) != SG_RESOURCESTATE_VALID)
+    {
+        if (height.id) sg_destroy_image(height);
+        sg_destroy_image(depth);
+        log_warn("[renderer] image pair %u could not recreate the height chain -- skipped",
+                 (unsigned)handle);
+        return false;
+    }
+
+    // Both new images are valid: swap them in atomically for the readers.
+    const std::vector<float> hull_px =
+        BuildTileTightProxyHull(static_cast<const float*>(depth_r32f), e.width, e.height);
+    if (e.depth.id)
+        sg_destroy_image(e.depth);
+    if (e.height_minmax.id)
+        sg_destroy_image(e.height_minmax);
+    e.depth = depth;
+    e.height_minmax = height;
+    e.height_minmax_mips = height_desc.num_mipmaps;
+    e.tight_proxy_hull_px = hull_px;
+    e.tight_proxy_points = uint32_t(hull_px.size() / 2u);
+    e.depth_is_art = from_art ? 1u : 0u;
     return true;
 }
 

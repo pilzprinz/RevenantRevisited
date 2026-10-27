@@ -129,13 +129,14 @@ int32_t preferred_tier(const std::filesystem::path& p)
     return tier;
 }
 
-// Directories that hold something other than tile albedo art. ("Remade" is
-// NOT here: its properly named files are hand-staged albedo art -- see
-// preferred_tier -- and its stray files do not match the tile naming and
-// are ignored anyway.)
+// Directories that hold something other than tile art. ("Remade" is NOT
+// here: its properly named files are hand-staged art -- see preferred_tier
+// -- and its stray files do not match the tile naming and are ignored
+// anyway. "alpha"/"depth" are not here either: those folders hold the
+// tree's own alpha/depth maps, same naming.)
 bool skipped_dir(const std::string& name)
 {
-    static const char* kSkip[] = {"alpha", "depth", "original", "gemini", "raw", "icons"};
+    static const char* kSkip[] = {"original", "gemini", "raw", "icons"};
     const std::string lowered = lower(name);
     for (const char* skip : kSkip)
         if (lowered == skip)
@@ -143,17 +144,49 @@ bool skipped_dir(const std::string& name)
     return false;
 }
 
+// The channel a file belongs to.
+enum class EChannel { kAlbedo = 0, kAlpha, kDepth };
+
+// "<NNNN>_<Name>[_alpha|_depth].png" -> the base stem and the channel, or
+// "" when the file is not one of ours (masks, visualisations, stray art).
+// The dump writes the maps next to the albedo with a suffix; the staging
+// layout also accepts the bare names inside "alpha"/"depth" folders (the
+// walk decides by the folder, this one by the suffix).
+std::string parse_art_name(const std::string& filename, EChannel& out_channel)
+{
+    const std::string stem = tile_stem(filename);
+    if (stem.empty())
+        return {};
+    out_channel = EChannel::kAlbedo;
+    static const char* kSuffixes[] = {"_alpha", "_depth"};
+    static const EChannel kChannels[] = {EChannel::kAlpha, EChannel::kDepth};
+    for (int32_t i = 0; i < 2; ++i)
+    {
+        const size_t n = std::strlen(kSuffixes[i]);
+        if (stem.size() > n && stem.compare(stem.size() - n, n, kSuffixes[i]) == 0)
+        {
+            out_channel = kChannels[i];
+            return stem.substr(0, stem.size() - n);
+        }
+    }
+    return stem;
+}
+
 std::filesystem::path s_root;
 std::string  s_root_display;
 bool         s_enabled = false;
 int32_t      s_count = 0;
-std::unordered_map<std::string, std::filesystem::path> s_by_key;  // "0763_kep" -> file
-std::unordered_map<std::string, std::string> s_by_name;           // "kep" -> key ("" when ambiguous)
+std::unordered_map<std::string, std::filesystem::path> s_by_key;        // "0763_kep" -> file
+std::unordered_map<std::string, std::filesystem::path> s_alpha_by_key;  // "0763_kep" -> _alpha.png
+std::unordered_map<std::string, std::filesystem::path> s_depth_by_key;  // "0763_kep" -> _depth.png
+std::unordered_map<std::string, std::string> s_by_name;                 // "kep" -> key ("" when ambiguous)
 
-// The art file for a tile, or nullptr when the tree has none. Names are
-// unique per class in retail, but objtype indices are not unique across
-// classes, so the name is the fallback when it is unambiguous.
-const std::filesystem::path* FindArt(int32_t objtype, const char* type_name)
+// The art file for a tile in one channel's map, or nullptr when the tree
+// has none. Names are unique per class in retail, but objtype indices are
+// not unique across classes, so the name is the fallback when it is
+// unambiguous (albedo only).
+const std::filesystem::path* FindArtIn(const std::unordered_map<std::string, std::filesystem::path>& map,
+                                       int32_t objtype, const char* type_name)
 {
     const std::string safe = sanitize_component(type_name);
     if (safe.empty() || safe.size() > 200)
@@ -161,10 +194,12 @@ const std::filesystem::path* FindArt(int32_t objtype, const char* type_name)
 
     char key_buffer[256];
     std::snprintf(key_buffer, sizeof(key_buffer), "%04d_%s", objtype, safe.c_str());
-    auto it = s_by_key.find(lower(key_buffer));
-    if (it != s_by_key.end())
+    auto it = map.find(lower(key_buffer));
+    if (it != map.end())
         return &it->second;
 
+    if (&map != &s_by_key)
+        return nullptr;   // the maps carry no name fallback
     auto named = s_by_name.find(lower(safe));
     if (named == s_by_name.end() || named->second.empty())
         return nullptr;
@@ -172,6 +207,11 @@ const std::filesystem::path* FindArt(int32_t objtype, const char* type_name)
     if (it == s_by_key.end())
         return nullptr;
     return &it->second;
+}
+
+const std::filesystem::path* FindArt(int32_t objtype, const char* type_name)
+{
+    return FindArtIn(s_by_key, objtype, type_name);
 }
 
 // Read a PNG file into an SImage. Returns false when the file is missing or
@@ -242,6 +282,8 @@ int32_t TileTexOverride::Init()
     s_root.clear();
     s_root_display.clear();
     s_by_key.clear();
+    s_alpha_by_key.clear();
+    s_depth_by_key.clear();
     s_by_name.clear();
     s_count = 0;
     s_enabled = false;
@@ -275,6 +317,27 @@ int32_t TileTexOverride::Init()
 
     int32_t duplicates = 0;
     std::error_code walk_ec;
+    // Tiered insert shared by all three channels: hand-staged art wins over
+    // the bulk set, equal tiers keep the first one found.
+    auto store_art = [&](std::unordered_map<std::string, std::filesystem::path>& map,
+                         const std::string& key_stem, const fs::path& path)
+    {
+        auto found = map.find(key_stem);
+        if (found == map.end())
+        {
+            map.emplace(key_stem, path);
+            return;
+        }
+        if (preferred_tier(path) > preferred_tier(found->second))
+        {
+            found->second = path;
+            ++duplicates;
+        }
+        else
+        {
+            ++duplicates;
+        }
+    };
     for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, walk_ec), end;
          it != end; it.increment(walk_ec))
     {
@@ -293,34 +356,37 @@ int32_t TileTexOverride::Init()
         if (!de.is_regular_file(walk_ec))
             continue;
 
-        const std::string stem = tile_stem(de.path().filename().string());
+        EChannel channel = EChannel::kAlbedo;
+        std::string stem = parse_art_name(de.path().filename().string(), channel);
         if (stem.empty())
             continue;
+        // A file inside an "alpha"/"depth" folder belongs to that channel no
+        // matter what its name says.
+        for (const auto& part : de.path().lexically_relative(root))
+        {
+            const std::string s = lower(part.string());
+            if (s == "alpha") { channel = EChannel::kAlpha; break; }
+            if (s == "depth") { channel = EChannel::kDepth; break; }
+        }
 
-        auto found = s_by_key.find(stem);
-        if (found == s_by_key.end())
-        {
-            s_by_key.emplace(stem, de.path());
-        }
-        else if (preferred_tier(de.path()) > preferred_tier(found->second))
-        {
-            found->second = de.path(); // hand-staged art wins over the bulk set
-            ++duplicates;
-        }
+        if (channel == EChannel::kAlpha)
+            store_art(s_alpha_by_key, stem, de.path());
+        else if (channel == EChannel::kDepth)
+            store_art(s_depth_by_key, stem, de.path());
         else
         {
-            ++duplicates;
-        }
+            store_art(s_by_key, stem, de.path());
 
-        const size_t underscore = stem.find('_');
-        if (underscore != std::string::npos)
-        {
-            const std::string name = stem.substr(underscore + 1);
-            auto named = s_by_name.find(name);
-            if (named == s_by_name.end())
-                s_by_name.emplace(name, stem);
-            else if (named->second != stem)
-                named->second.clear(); // same name, several objtypes: objtype decides
+            const size_t underscore = stem.find('_');
+            if (underscore != std::string::npos)
+            {
+                const std::string name = stem.substr(underscore + 1);
+                auto named = s_by_name.find(name);
+                if (named == s_by_name.end())
+                    s_by_name.emplace(name, stem);
+                else if (named->second != stem)
+                    named->second.clear(); // same name, several objtypes: objtype decides
+            }
         }
     }
 
@@ -334,8 +400,10 @@ int32_t TileTexOverride::Init()
     s_root = root;
     s_root_display = to_utf8(root);
     s_enabled = true;
-    log_info("[tiletex] high-res tile art: %d tiles from %s (%d duplicate entries, 'Final' wins)",
-             s_count, s_root_display.c_str(), duplicates);
+    log_info("[tiletex] high-res tile art: %d tile(s) from %s (%d duplicate entries, "
+             "'Final' wins; alpha maps: %d, depth maps: %d)",
+             s_count, s_root_display.c_str(), duplicates,
+             int32_t(s_alpha_by_key.size()), int32_t(s_depth_by_key.size()));
     return s_count;
 }
 
@@ -358,6 +426,22 @@ bool TileTexOverride::Load(int32_t objtype, const char* type_name, SImage& out)
         return false;
     }
     return DecodePng(*art, out);
+}
+
+bool TileTexOverride::LoadAlpha(int32_t objtype, const char* type_name, SImage& out)
+{
+    if (!s_enabled || objtype < 0 || !type_name || !*type_name)
+        return false;
+    const std::filesystem::path* art = FindArtIn(s_alpha_by_key, objtype, type_name);
+    return art ? DecodePng(*art, out) : false;
+}
+
+bool TileTexOverride::LoadDepth(int32_t objtype, const char* type_name, SImage& out)
+{
+    if (!s_enabled || objtype < 0 || !type_name || !*type_name)
+        return false;
+    const std::filesystem::path* art = FindArtIn(s_depth_by_key, objtype, type_name);
+    return art ? DecodePng(*art, out) : false;
 }
 
 const char* TileTexOverride::Root()

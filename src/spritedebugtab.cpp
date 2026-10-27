@@ -12,6 +12,7 @@
 #include "tiletreload.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -21,6 +22,7 @@ namespace {
 // shows the new art in the same frame.
 bool     g_reload_pending = false;
 int32_t  g_pending_mode = 0;     // the mode the panel asks for
+bool     g_save_pending = false; // the mode/root/override change asked for an ini save
 int32_t  g_last_frames = 0;
 int32_t  g_last_images = 0;
 double   g_last_ms = 0.0;
@@ -28,18 +30,46 @@ double   g_last_ms = 0.0;
 // The tile art's reloads (the location's art), same pattern.
 bool     g_tiles_pending = false;
 int32_t  g_tiles_mode = 0;
+bool     g_tiles_save_pending = false;  // the mode/root change asked for an ini save
 int32_t  g_last_tiles_visited = 0;
 int32_t  g_last_tiles_updated = 0;
 double   g_tiles_ms = 0.0;
 
 // The art root boxes. Initialized from the session's settings once (the
 // ini value at boot, later reloads never rewrite them); "Use this folder"
-// pushes the typed path into the session and reloads. Nothing is written
-// to Revenant.ini until the debug panel's own Save button.
+// pushes the typed path into the session, reloads and saves it to
+// Revenant.ini right away (SavePanelSettings), so the path survives a
+// restart without a trip to the Lighting tab's Save button.
 char    g_tile_root_buf[512] = "";
 bool    g_tile_root_buf_ready = false;
 char    g_sprite_root_buf[512] = "";
 bool    g_sprite_root_buf_ready = false;
+
+// The panel's own settings write-back. The art roots and the modes live in
+// RevisitedSettings, so a save here round-trips them (plus whatever the
+// ini already holds) into the overlay Revenant.ini -- the user no longer
+// has to visit the Lighting tab's Save button to keep the art path.
+char    g_save_msg[260] = {0};
+double  g_save_msg_until = 0.0;
+
+void SavePanelSettings()
+{
+    char path[256] = {0};
+    if (SaveRevisitedSettings(path, sizeof(path)))
+        std::snprintf(g_save_msg, sizeof(g_save_msg), "saved: %s", path);
+    else
+        std::snprintf(g_save_msg, sizeof(g_save_msg),
+                      "save failed (need --revisited + writable overlay)");
+    g_save_msg_until = ImGui::GetTime() + 4.0;
+}
+
+void DrawSaveStatus()
+{
+    // Every frame while the toast is live, independent of the reload flow:
+    // the reload happens in the click's frame, the message has to outlive it.
+    if (ImGui::GetTime() < g_save_msg_until)
+        ImGui::TextUnformatted(g_save_msg);
+}
 
 void CopyRootToBuf(char* buf, size_t size, bool& ready, const std::string& value)
 {
@@ -81,13 +111,42 @@ static void DrawTileArtSection()
     {
         g_tiles_mode = 0;
         g_tiles_pending = true;
+        g_tiles_save_pending = true;
     }
     ImGui::SameLine();
     if (ImGui::RadioButton("Modern", modern) && !modern)
     {
         g_tiles_mode = 1;
         g_tiles_pending = true;
+        g_tiles_save_pending = true;
     }
+    // The depth maps' own switch ([Revisited] HighResTileDepthMode),
+    // independent of the colour: a broken _depth map rolls back to the
+    // retail relief without losing the tree's art.
+    ImGui::TextUnformatted("depth maps:");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("retail##tiledepth", RevisitedSettings.high_res_tile_depth_mode == 0) &&
+        RevisitedSettings.high_res_tile_depth_mode != 0)
+    {
+        RevisitedSettings.high_res_tile_depth_mode = 0;
+        g_tiles_mode = RevisitedSettings.high_res_tile_mode;
+        g_tiles_pending = true;
+        g_tiles_save_pending = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton("modern##tiledepth", RevisitedSettings.high_res_tile_depth_mode != 0) &&
+        RevisitedSettings.high_res_tile_depth_mode == 0)
+    {
+        RevisitedSettings.high_res_tile_depth_mode = 1;
+        g_tiles_mode = RevisitedSettings.high_res_tile_mode;
+        g_tiles_pending = true;
+        g_tiles_save_pending = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "HighResTileDepthMode: the relief the tiles draw.\n"
+            "retail = the retail z-buffer; modern = the tree's\n"
+            "_depth maps (for the tiles that carry one).");
     ImGui::Separator();
 
     ImGui::Text("tiles the renderer holds: %d", TileArtReload::TileCount());
@@ -112,6 +171,7 @@ static void DrawTileArtSection()
                                                               : RevisitedSettings.high_res_tile_root.c_str());
         g_tiles_mode = RevisitedSettings.high_res_tile_mode;
         g_tiles_pending = true;   // the reload re-indexes the new root first
+        g_tiles_save_pending = true;  // keep the typed path across restarts
     }
     ImGui::Separator();
 
@@ -137,7 +197,13 @@ static void DrawTileArtSection()
     g_tiles_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     log_info("[tiletex] panel reloaded %d of %d tile(s) in %.1f ms",
              g_last_tiles_updated, visited, g_tiles_ms);
+    if (g_tiles_save_pending)
+    {
+        g_tiles_save_pending = false;
+        SavePanelSettings();
+    }
 }
+
 
 // One section of the tab: the 3D models' textures (characters, monsters,
 // props from .I3D).
@@ -151,15 +217,31 @@ static void DrawModelArtSection()
     {
         g_pending_mode = 0;
         g_reload_pending = true;
+        g_save_pending = true;
     }
     ImGui::SameLine();
     if (ImGui::RadioButton("Modern", modern) && !modern)
     {
         g_pending_mode = 1;
         g_reload_pending = true;
+        g_save_pending = true;
     }
     ImGui::PopID();
     ImGui::Separator();
+
+    // The [Revisited] SpriteOverride switch, as an ini-backed checkbox right
+    // where the art tree is edited: untick to stop indexing the tree at all
+    // (the reload then falls back to retail pixels), tick to bring it back.
+    if (ImGui::Checkbox("highressprites", &RevisitedSettings.sprite_override))
+    {
+        g_pending_mode = RevisitedSettings.sprite_mode;
+        g_reload_pending = true;
+        g_save_pending = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(
+            "SpriteOverride: index the PNG art tree under the art root.\n"
+            "Off = retail 1998 pixels everywhere, on = matching PNGs win.");
 
     ImGui::Text("art tree: %s", SpriteTexOverride::Root());
     ImGui::SameLine();
@@ -186,6 +268,7 @@ static void DrawModelArtSection()
                                                        : RevisitedSettings.sprite_root.c_str());
         g_pending_mode = RevisitedSettings.sprite_mode;
         g_reload_pending = true;  // the reload re-indexes the new root first
+        g_save_pending = true;    // keep the typed path across restarts
     }
 
     if (ImGui::Button("Reload sprites"))
@@ -223,6 +306,11 @@ static void DrawModelArtSection()
     g_last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     log_info("[spriteart] reloaded %d sprite texture frame(s) in %d image(s) in %.1f ms",
              g_last_frames, images, g_last_ms);
+    if (g_save_pending)
+    {
+        g_save_pending = false;
+        SavePanelSettings();
+    }
 }
 
 void DrawSpritesTab()
@@ -233,4 +321,7 @@ void DrawSpritesTab()
         DrawTileArtSection();
     if (ImGui::CollapsingHeader("Model textures (3D)", ImGuiTreeNodeFlags_DefaultOpen))
         DrawModelArtSection();
+    // The save toast lives here so it outlives the reload frame (the
+    // sections early-out when nothing is pending).
+    DrawSaveStatus();
 }

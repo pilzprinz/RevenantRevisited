@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "debugui.h"
+#include "renderer.h"
 
 struct S3DPoint;
 struct SRevisitedSettings;
@@ -285,6 +286,13 @@ class TMapRenderer
     // Non-const: the reload keeps the entry's own state (which art the
     // colour image holds) in sync without re-noting.
     [[nodiscard]] STileArtEntry* TileArtAt(int32_t index) const;
+    // Propagate a depth-image replacement (TileArtReload) into the CPU
+    // side: every resident sector tile with this image pair re-learns its
+    // depth copy, z range and dump, so the CPU projection and sorting match
+    // the GPU relief again. `depth` is local-z per texel at the tile's
+    // retail size (0 = no height), `depth_count` its texel count.
+    void UpdateTileArtDepthCPUCopy(RendererImagePairHandle image_pair,
+                                    const float* depth, size_t depth_count);
 
   private:
     std::function<void()> review_before_world_;

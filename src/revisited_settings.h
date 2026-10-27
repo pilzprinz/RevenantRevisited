@@ -90,6 +90,10 @@ struct SRevisitedSettings {
     // can be switched while the game runs (the "reloadtiles" command, the
     // debug panel): the loaded tiles are re-coloured in place then.
     int32_t     high_res_tile_mode = 1;
+    // Which tile depth the game shows: 0 = the retail relief, 1 = the tree's
+    // _depth maps (for the tiles that carry one). Independent of the colour
+    // mode, so a broken depth map rolls back without losing the art.
+    int32_t     high_res_tile_depth_mode = 1;
 
     // ---- Sprite art (see spritetexoverride.h) ------------------------------
     bool        sprite_override = true;  // index the sprite art tree

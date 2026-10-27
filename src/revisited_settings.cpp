@@ -124,6 +124,7 @@ bool LoadRevisitedSettings()
     if (const char *root = ini.GetValue(kSection, "HighResTileRoot", s.high_res_tile_root.c_str()))
         s.high_res_tile_root = root;
     s.high_res_tile_mode = (int32_t)ini.GetLongValue(kSection, "HighResTileMode", s.high_res_tile_mode);
+    s.high_res_tile_depth_mode = (int32_t)ini.GetLongValue(kSection, "HighResTileDepthMode", s.high_res_tile_depth_mode);
 
     s.sprite_override = ini.GetBoolValue(kSection, "SpriteOverride", s.sprite_override);
     if (const char *root = ini.GetValue(kSection, "SpriteRoot", s.sprite_root.c_str()))
@@ -157,6 +158,7 @@ bool LoadTileArtOverrideSettings()
     if (const char *root = ini.GetValue(kSection, "HighResTileRoot", s.high_res_tile_root.c_str()))
         s.high_res_tile_root = root;
     s.high_res_tile_mode = (int32_t)ini.GetLongValue(kSection, "HighResTileMode", s.high_res_tile_mode);
+    s.high_res_tile_depth_mode = (int32_t)ini.GetLongValue(kSection, "HighResTileDepthMode", s.high_res_tile_depth_mode);
     return s.high_res_tiles;
 }
 
@@ -323,6 +325,8 @@ bool SaveRevisitedSettings(char *out_path, int32_t out_len)
         "; Tile art tree, names '<NNNN>_<Name>.png' as --dumptiles writes them; empty = <overlay>/Imagery", true);
     ini.SetLongValue(kSection, "HighResTileMode", s.high_res_tile_mode,
         "; Which tile art the game shows: 0 = retail pixels, 1 = modern (the tree)", true);
+    ini.SetLongValue(kSection, "HighResTileDepthMode", s.high_res_tile_depth_mode,
+        "; Which tile depth the game shows: 0 = retail relief, 1 = the tree's _depth maps", true);
 
     ini.SetBoolValue(kSection, "SpriteOverride", s.sprite_override,
         "; Swap a sprite's texture for matching PNG art from the sprite art tree", true);

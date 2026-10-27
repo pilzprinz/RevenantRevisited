@@ -392,6 +392,10 @@ struct SRendererImagePairInfo
     uint32_t tight_proxy_points = 0;
     uint64_t gpu_bytes = 0;
     uint32_t ref_count = 0;
+    // Non-zero while the depth image holds the tree's _depth map instead of
+    // the retail relief (the tile depth switch reads this, not a per-tile
+    // copy: the pair is the one state every holder of the handle shares).
+    uint32_t depth_is_art = 0;
 };
 
 // Renderer-owned single texture image. TTextureHandle is shared with the
@@ -674,6 +678,8 @@ public:
     // records and visible instances must not own GPU residency. Refcount zero
     // is retained for now so we do not hitch during play; a future explicit
     // eviction path can free zero-ref assets here under renderer memory policy.
+    // Non-zero when the pair's first depth upload was the tree's _depth map
+    // (see UpdateImagePairDepth's `from_art`).
     RendererImagePairHandle RegisterImagePairAsset(uint64_t key,
                                                    const void* color_rgba8,
                                                    size_t color_bytes,
@@ -683,7 +689,8 @@ public:
                                                    int32_t height,
                                                    uint64_t gpu_bytes,
                                                    int32_t color_width = 0,
-                                                   int32_t color_height = 0);
+                                                   int32_t color_height = 0,
+                                                   bool depth_is_art = false);
     const SRendererImagePairInfo* ImagePairInfo(RendererImagePairHandle handle) const;
     // Handle for an already-registered key, or 0. Lets callers skip work
     // (e.g. decoding high-res tile art) when the asset is already resident.
@@ -707,6 +714,18 @@ public:
     bool UpdateImagePairColor(RendererImagePairHandle handle,
                                const void* pixels, size_t pixel_bytes,
                                int32_t width, int32_t height);
+    // Replace the DEPTH image of an image pair (a tile's relief). The colour
+    // stays as it is. Same fresh-image rules as UpdateImagePairColor (an
+    // image bound as a shader resource can not be mapped); the height min/max
+    // chain and the tight proxy hull are rebuilt from the new depths, and the
+    // size must stay the pair's own (the retail tile's): the CPU side and the
+    // proxies are keyed to it. `from_art` says which relief the pixels carry
+    // -- the tree's _depth map (true) or the retail one (false) -- and is
+    // what the tile depth switch asks the pair for, so a stale per-tile
+    // copy can not hold a tile on the wrong relief.
+    bool UpdateImagePairDepth(RendererImagePairHandle handle,
+                               const void* depth_r32f, size_t depth_bytes,
+                               bool from_art = false);
     void AddImagePairAssetRef(RendererImagePairHandle handle, uint32_t count = 1);
     void ReleaseImagePairAssetRef(RendererImagePairHandle handle, uint32_t count = 1);
 
